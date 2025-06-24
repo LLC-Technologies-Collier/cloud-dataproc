@@ -1,75 +1,80 @@
 #!/bin/bash
-# CUJ: Standard Dataproc Cluster Management
+#
+# CUJ: GCE Cluster Management with Cloud NAT
+#
+# This script manages the lifecycle of a standard Dataproc on GCE cluster.
+# It creates a dedicated VPC with a Cloud Router and NAT gateway to provide
+# internet access for the cluster nodes without requiring public IP addresses.
+
+set -e
 
 function main() {
   local SCRIPT_DIR
   SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-  source "${SCRIPT_DIR}/../../lib/common.sh"
-  set -e
+  source "${SCRIPT_DIR}/../../../lib/common.sh"
   load_config
 
+  # --- Define derived resource names ---
+  # All resource names are derived from the single top-level name in env.json
+  # to simplify configuration.
+  local cluster_name="${CONFIG[GCE_CLUSTER_NAME]}"
+  local network_name="${cluster_name}-net"
+  local subnet_name="${cluster_name}-subnet"
+  local router_name="${cluster_name}-router"
+  local firewall_prefix="${cluster_name}-fw"
+
+  # --- Helper Functions ---
+  # These functions orchestrate calls to the common library.
+  function up() {
+    header "Provisioning environment for CUJ: ${cluster_name}"
+    # The library functions will be idempotent.
+    create_network "${network_name}"
+    create_subnet "${network_name}" "${subnet_name}" "${CONFIG[GCE_SUBNET_RANGE]}" "${CONFIG[REGION]}"
+    create_firewall_rules "${network_name}" "${firewall_prefix}" "${CONFIG[CUJ_TAG]}"
+    create_router "${network_name}" "${router_name}" "${CONFIG[REGION]}" "${CONFIG[GCE_ROUTER_ASN]}"
+    add_nat_gateway_to_router "${router_name}" "${CONFIG[REGION]}"
+
+    header "Creating Dataproc cluster '${cluster_name}'"
+    create_gce_cluster "${cluster_name}" "${subnet_name}" "${CONFIG[REGION]}" "${CONFIG[CUJ_TAG]}"
+    echo "Environment for '${cluster_name}' is UP."
+  }
+
+  function down() {
+    header "Tearing down environment for CUJ: ${cluster_name}"
+    # Teardown is in reverse order of creation.
+    delete_gce_cluster "${cluster_name}" "${CONFIG[REGION]}"
+    # Deleting a router also deletes its NAT gateway.
+    delete_router "${router_name}" "${CONFIG[REGION]}"
+    delete_firewall_rules "${firewall_prefix}"
+    # Deleting a network also deletes its subnets.
+    delete_network "${network_name}"
+    echo "Environment for '${cluster_name}' is DOWN."
+  }
+
   function validate() {
-    header "Validating prerequisites"
-    echo "Checking for shared GCS bucket..."
-    if ! gsutil -q stat "gs://${CONFIG[SHARED_GCS_BUCKET]}/"; then
-      echo "ERROR: Shared GCS bucket 'gs://${CONFIG[SHARED_GCS_BUCKET]}/' not found." >&2
-      echo "Please run the script in 'gcloud/onboarding/' first." >&2
-      exit 1
-    fi
-    echo "Prerequisites met."
+    header "Validating APIs for CUJ: ${cluster_name}"
+    validate_apis "compute.googleapis.com" "dataproc.googleapis.com"
   }
 
-  function create_cluster() {
-    # ---FIX---
-    # Add defensive check for required configuration.
-    if [[ -z "${CONFIG[CLUSTER_NAME]}" || -z "${CONFIG[REGION]}" || -z "${CONFIG[SUBNET]}" || -z "${CONFIG[CUJ_TAG]}" ]]; then
-      echo "ERROR: One or more required keys (CLUSTER_NAME, REGION, SUBNET, CUJ_TAG) are missing from env.json" >&2
-      exit 1
-    fi
-    # ---END FIX---
 
-    echo "Creating Dataproc cluster '${CONFIG[CLUSTER_NAME]}'..."
-    set -x
-    gcloud dataproc clusters create "${CONFIG[CLUSTER_NAME]}" \
-      --region="${CONFIG[REGION]}" \
-      --subnet="${CONFIG[SUBNET]}" \
-      --tags="${CONFIG[CUJ_TAG]}" \
-      --format json
-    set +x
-  }
-
-  function delete_cluster() {
-    if [[ -z "${CONFIG[CLUSTER_NAME]}" || -z "${CONFIG[REGION]}" ]]; then
-       echo "ERROR: One or more required keys (CLUSTER_NAME, REGION) are missing from env.json" >&2
-       exit 1
-    fi
-    echo "Deleting Dataproc cluster '${CONFIG[CLUSTER_NAME]}'..."
-    if gcloud dataproc clusters describe "${CONFIG[CLUSTER_NAME]}" --region="${CONFIG[REGION]}" &>/dev/null; then
-      gcloud dataproc clusters delete --quiet "${CONFIG[CLUSTER_NAME]}" --region="${CONFIG[REGION]}"
-    else
-      echo "Cluster '${CONFIG[CLUSTER_NAME]}' not found, skipping delete."
-    fi
-  }
-
+  # --- Main command handler ---
   case "$1" in
+    up)
+      up
+      ;;
+    down)
+      confirm "This will delete cluster '${cluster_name}' and its entire NATed network environment."
+      down
+      ;;
+    rebuild)
+      down || true
+      up
+      ;;
     validate)
       validate
       ;;
-    up) # Creates the full managed stack for this CUJ
-      validate
-      create_network_and_subnet
-      create_cluster
-      ;;
-    down) # Deletes the full managed stack for this CUJ
-      delete_cluster
-      delete_network_and_subnet
-      ;;
-    cluster-rebuild) # Cycles the cluster, leaves network
-      (delete_cluster) || true
-      create_cluster
-      ;;
     *)
-      echo "Usage: $0 {validate|up|down|cluster-rebuild}"
+      echo "Usage: $0 {up|down|rebuild|validate}"
       exit 1
       ;;
   esac
